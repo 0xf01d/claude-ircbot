@@ -833,7 +833,7 @@ def handle_server_line(line):
         # trust_check's 307: test pod, not the production gate.
         if (ECHO_TEST and target.startswith(("#", "&"))
                 and NICK.lower() in body.lower() and is_trust_listed(nick)):
-            send_raw(f"PRIVMSG {target} :ciao {nick}! katiabot e vivo (transport test, nessun cervello collegato)")
+            send_raw(f"PRIVMSG {target} :ciao {nick}! test-bot operativo (solo trasporto, nessun cervello collegato)")
         if is_trust_listed(nick) and not trusted:
             emit("TRUST_DENIED", nick, host, reason)
         # Re-arm the idle timer only on HUMAN PRIVMSG to a tracked channel.
