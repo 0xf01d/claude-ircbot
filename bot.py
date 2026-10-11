@@ -80,6 +80,7 @@ TLS_VERIFY = _cfg("IRC_TLS_VERIFY", "1") not in ("0", "no", "off", "false")
 
 LOG = _cfg("BOT_LOG", os.path.join(HERE, "bot.log"))
 FIFO = _cfg("BOT_FIFO", os.path.join(HERE, "bot.send"))
+ECHO_TEST = os.environ.get("BOT_ECHO_TEST", "0") == "1"
 TRUST_FILE = _cfg("BOT_TRUST", os.path.join(HERE, "bot.trust"))
 ENV_FILE = _cfg("BOT_ENV", os.path.join(HERE, ".env"))
 STARTUP_FILE = _cfg("BOT_STARTUP", os.path.join(HERE, "bot.startup"))
@@ -825,6 +826,14 @@ def handle_server_line(line):
                      "replied" if replied else "silent")
             return
         emit("MSG", trust, f"FROM={nick}", f"HOST={host}", f"TO={target}", f"BODY={body}")
+        # k8s test responder (0xf01d fork, 2026-10-10, chat_R1uvu): a transport-only
+        # deployment has no agent brain attached, so when BOT_ECHO_TEST=1 a
+        # trust-LISTED nick addressing us by name gets a canned pong — the
+        # transport loop becomes observable end to end. Deliberately skips
+        # trust_check's 307: test pod, not the production gate.
+        if (ECHO_TEST and target.startswith(("#", "&"))
+                and NICK.lower() in body.lower() and is_trust_listed(nick)):
+            send_raw(f"PRIVMSG {target} :ciao {nick}! katiabot e vivo (transport test, nessun cervello collegato)")
         if is_trust_listed(nick) and not trusted:
             emit("TRUST_DENIED", nick, host, reason)
         # Re-arm the idle timer only on HUMAN PRIVMSG to a tracked channel.
