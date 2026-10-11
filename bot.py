@@ -28,7 +28,9 @@ Minimal IRC bot bridging a claude-code conversation <-> Azzurra IRC.
   (vjt's ruling, 2026-08-26: "tenere context su due righe no").
 """
 import fnmatch
+import json
 import os
+import queue
 import random
 import re
 import socket
@@ -36,6 +38,9 @@ import ssl
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
+from collections import deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -80,7 +85,6 @@ TLS_VERIFY = _cfg("IRC_TLS_VERIFY", "1") not in ("0", "no", "off", "false")
 
 LOG = _cfg("BOT_LOG", os.path.join(HERE, "bot.log"))
 FIFO = _cfg("BOT_FIFO", os.path.join(HERE, "bot.send"))
-ECHO_TEST = os.environ.get("BOT_ECHO_TEST", "0") == "1"
 TRUST_FILE = _cfg("BOT_TRUST", os.path.join(HERE, "bot.trust"))
 ENV_FILE = _cfg("BOT_ENV", os.path.join(HERE, ".env"))
 STARTUP_FILE = _cfg("BOT_STARTUP", os.path.join(HERE, "bot.startup"))
@@ -406,6 +410,120 @@ def split_say(target, text, origin=None):
             cut += 1  # keep the breaking space on this chunk, don't strip it
         send_raw(f"PRIVMSG {target} :{b[:cut].decode('utf-8', errors='ignore')}", origin)
         b = b[cut:]
+
+
+# --------------------------------------------------------------------------
+# Brain: LLM replies via the zai OpenAI-compatible API (fleet standard).
+# k8s test deployment, 2026-10-11: on a trust-listed channel mention the bot
+# answers through POST {OMP_API_BASE}/chat/completions. Stdlib-only (urllib),
+# single-file philosophy kept. The API key lives only in the Authorization
+# header and is never logged: error events carry the HTTP status or the
+# exception repr, neither of which contains it. If OMP_API_KEY is unset the
+# brain is disabled — no canned fallback, the bot just transports.
+# --------------------------------------------------------------------------
+BRAIN_API_KEY = os.environ.get("OMP_API_KEY", "")
+BRAIN_API_BASE = _cfg("OMP_API_BASE", "https://api.z.ai/api/paas/v4").rstrip("/")
+BRAIN_MODEL = _cfg("OMP_MODEL", "glm-5.3-flash")
+BRAIN_MAX_TOKENS = int(_cfg("BRAIN_MAX_TOKENS", "300"))
+BRAIN_RATE_SECONDS = 60.0
+BRAIN_CONTEXT_LINES = 8
+BRAIN_TIMEOUT = 30
+BRAIN_SYSTEM_PROMPT = (
+    "Sei katiabot, bot di test della flotta IRC di katia. "
+    "Rispondi BREVE (max 2 frasi), in italiano, secco e utile."
+)
+BRAIN_ENABLED = bool(BRAIN_API_KEY)
+
+_brain_queue = queue.Queue()
+_brain_seen = deque(maxlen=BRAIN_CONTEXT_LINES)  # last channel lines: (nick, body)
+_brain_last = {}                                 # nick_lower -> last-reply monotonic
+_brain_lock = threading.Lock()
+
+
+def brain_observe(nick, target, body):
+    """Channel PRIVMSG hook: remember the line, maybe enqueue a reply.
+
+    Fires on is_trust_listed only (not full trust_check: its 307 WHOIS
+    round-trip is asynchronous — see the DM path). DMs never reach the brain.
+    """
+    if not target.startswith(("#", "&")):
+        return
+    with _brain_lock:
+        _brain_seen.append((nick, body))
+    if not BRAIN_ENABLED or not is_trust_listed(nick):
+        return
+    if NICK.lower() not in body.lower():
+        return
+    _brain_queue.put((nick, target, body))
+
+
+def brain_start():
+    """Start the worker thread, or log the disabled state once."""
+    if BRAIN_ENABLED:
+        threading.Thread(target=_brain_worker, daemon=True).start()
+    else:
+        emit("BRAIN_DISABLED", "OMP_API_KEY unset: brain off")
+
+
+def _brain_chat(messages):
+    url = BRAIN_API_BASE + "/chat/completions"
+    payload = json.dumps({
+        "model": BRAIN_MODEL,
+        "messages": messages,
+        "max_tokens": BRAIN_MAX_TOKENS,
+        "temperature": 0.7,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, method="POST",
+        headers={
+            "Authorization": f"Bearer {BRAIN_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=BRAIN_TIMEOUT) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+
+def _brain_worker():
+    while True:
+        nick, target, body = _brain_queue.get()
+        try:
+            # One reply per nick per BRAIN_RATE_SECONDS. A dropped mention
+            # burns nothing: the window starts at the last reply actually sent.
+            now = time.monotonic()
+            key = nick.lower()
+            with _brain_lock:
+                if now - _brain_last.get(key, 0.0) < BRAIN_RATE_SECONDS:
+                    emit("BRAIN_RATE_LIMITED", f"TO={nick}", f"CHAN={target}")
+                    continue
+                _brain_last[key] = now
+            # The triggering line was appended to the ring in brain_observe;
+            # it comes back as its own user message below, so drop it from the
+            # context when it is still the ring's tail (worker keeping up).
+            with _brain_lock:
+                context = list(_brain_seen)
+            if context and context[-1] == (nick, body):
+                context.pop()
+            messages = [{"role": "system", "content": BRAIN_SYSTEM_PROMPT}]
+            messages += [{"role": "user", "content": f"{n}: {b}"} for n, b in context]
+            messages.append({"role": "user", "content": f"{nick}: {body}"})
+            try:
+                data = _brain_chat(messages)
+                reply = (data["choices"][0].get("message") or {}).get("content") or ""
+                reply = reply.strip()
+            except urllib.error.HTTPError as e:
+                emit("BRAIN_ERROR", f"FROM={nick}", f"HTTP={e.code}")
+                continue
+            except Exception as e:
+                emit("BRAIN_ERROR", f"FROM={nick}", repr(e))
+                continue
+            if not reply:
+                emit("BRAIN_ERROR", f"FROM={nick}", "empty-reply")
+                continue
+            split_say(target, reply)
+            emit("BRAIN_REPLIED", f"TO={nick}", f"CHAN={target}", f"LEN={len(reply)}")
+        finally:
+            _brain_queue.task_done()
 
 
 # DCC SEND. Serve a EliteWarez: il `!list` offre "warez", e prima o poi uno
@@ -826,14 +944,12 @@ def handle_server_line(line):
                      "replied" if replied else "silent")
             return
         emit("MSG", trust, f"FROM={nick}", f"HOST={host}", f"TO={target}", f"BODY={body}")
-        # k8s test responder (0xf01d fork, 2026-10-10, chat_R1uvu): a transport-only
-        # deployment has no agent brain attached, so when BOT_ECHO_TEST=1 a
-        # trust-LISTED nick addressing us by name gets a canned pong — the
-        # transport loop becomes observable end to end. Deliberately skips
-        # trust_check's 307: test pod, not the production gate.
-        if (ECHO_TEST and target.startswith(("#", "&"))
-                and NICK.lower() in body.lower() and is_trust_listed(nick)):
-            send_raw(f"PRIVMSG {target} :ciao {nick}! test-bot operativo (solo trasporto, nessun cervello collegato)")
+        # Real brain (zai API). Records the channel line as context and, when a
+        # trust-LISTED nick addresses us by name on a channel, enqueues a reply.
+        # Still gated on is_trust_listed only, like the canned pong it replaces
+        # (2026-10-11): NOT on trust_check's 307 — test pod, not the production
+        # gate. When the brain is disabled the hook is a no-op, no fallback.
+        brain_observe(nick, target, body)
         if is_trust_listed(nick) and not trusted:
             emit("TRUST_DENIED", nick, host, reason)
         # Re-arm the idle timer only on HUMAN PRIVMSG to a tracked channel.
@@ -1048,6 +1164,7 @@ def main():
 
     threading.Thread(target=writer_loop, daemon=True).start()
     threading.Thread(target=idle_ticker_loop, daemon=True).start()
+    brain_start()
     reader_loop()
 
 
